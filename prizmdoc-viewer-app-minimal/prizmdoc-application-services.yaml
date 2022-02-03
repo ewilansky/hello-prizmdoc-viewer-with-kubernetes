@@ -1,0 +1,203 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prizmdoc-application-services-config
+data:
+  # See https://help.accusoft.com/PrizmDoc/latest/HTML/pas-configuration.html
+  # for details on configuring Prizmdoc Application Services
+  pcc.nix.yml: |-
+    port: 3000
+    secretKey: "mysecretkey"
+    pccServer.hostName: "prizmdoc-server.prizmdoc.svc.cluster.local"
+    pccServer.port: 18681
+    pccServer.scheme: "http"
+    pccServer.apiKey: "{ACSAPIKeyIfNecessary}"
+    logs.path: "/logs"
+    defaults.viewingSessionTimeout: "20m"
+    documents.storage: "filesystem"
+    documents.path: "/data/documents"
+    documents.legacyMode: false
+    markupXml.storage: "filesystem"
+    markupXml.path: "/data/markup"
+    markupXml.legacyMode: false
+    markupLayerRecords.storage: "filesystem"
+    markupLayerRecords.path: "/data/markupLayerRecords"
+    markupLayerRecords.legacyMode: false
+    formDefinitions.storage: "filesystem"
+    formDefinitions.path: "/data/formDefinitions"
+    imageStamps.storage: "filesystem"
+    imageStamps.path: "/data/imageStamp"
+    imageStamps.validTypes: ["png", "jpg", "jpeg", "gif"]
+    viewingPackagesArtifacts.storage: "filesystem"
+    viewingPackagesArtifacts.path: "/data/viewingPackages"
+    feature.viewingPackages: "disabled"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prizmdoc-application-services-data
+  labels:
+    app.kubernetes.io/name: prizmdoc-application-services
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prizmdoc-application-services-logs
+  labels:
+    app.kubernetes.io/name: prizmdoc-application-services
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prizmdoc-application-services
+  labels:
+    app.kubernetes.io/name: prizmdoc-application-services
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prizmdoc-application-services
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prizmdoc-application-services
+    spec:
+      containers:
+        - name: prizmdoc-application-services
+          image: docker.io/accusoft/prizmdoc-application-services:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ACCEPT_EULA
+              value: "YES"
+          ports:
+            - name: public
+              containerPort: 3000
+              protocol: TCP
+          volumeMounts:
+            - name: prizmdoc-application-services-config
+              mountPath: /config
+              readOnly: true
+            - name: prizmdoc-application-services-data
+              mountPath: /data
+            - name: prizmdoc-application-services-logs-internal
+              mountPath: /logs
+          resources:
+            limits:
+              cpu: 500m
+              memory: 500Mi
+            requests:
+              cpu: 500m
+              memory: 500Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: public
+              scheme: HTTP
+            timeoutSeconds: 5
+          readinessProbe:
+            failureThreshold: 10
+            httpGet:
+              path: /health
+              port: public
+              scheme: HTTP
+            timeoutSeconds: 5
+        - name: prizmdoc-application-services-logging-agent
+          image: docker.io/fluent/fluent-bit:1.8.10
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: prizmdoc-application-services-fluent-config
+              mountPath: /fluent-bit/etc/
+            - name: prizmdoc-application-services-logs-internal
+              mountPath: /logs
+            - name: prizmdoc-application-services-logs
+              mountPath: /processed-logs
+          resources:
+            limits:
+              cpu: "0"
+              memory: "0"
+            requests:
+              cpu: "0"
+              memory: "0"
+      volumes:
+        - name: prizmdoc-application-services-config
+          configMap:
+            name: prizmdoc-application-services-config
+        - name: prizmdoc-application-services-data
+          persistentVolumeClaim:
+            claimName: prizmdoc-application-services-data
+        - name: prizmdoc-application-services-logs-internal
+          emptyDir: {}
+        - name: prizmdoc-application-services-logs
+          persistentVolumeClaim:
+            claimName: prizmdoc-application-services-logs
+        - name: prizmdoc-application-services-fluent-config
+          configMap:
+            name: prizmdoc-application-services-fluent-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prizmdoc-application-services
+  labels:
+    app.kubernetes.io/name: prizmdoc-application-services
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: prizmdoc-application-services
+  ports:
+    - name: public
+      port: 3000
+      protocol: TCP
+      targetPort: public
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prizmdoc-application-services-fluent-config
+data:
+  fluent-bit.conf: |-
+    [SERVICE]
+        Flush           5
+        Daemon          off
+        Parsers_File    parsers.conf
+
+    [INPUT]
+        Name            tail
+        Tag             ${POD_NAME}.<file_name>
+        Tag_Regex       /logs/(?<file_name>.*)
+        Path            /logs/*.log
+        DB              /logs/logs.db
+        Parser          json
+        Read_from_Head  True
+        Skip_Long_Lines On
+        Mem_Buf_Limit   5MB
+
+    [OUTPUT]
+        Name            file
+        Match           *
+        Format          plain
+        Path            /processed-logs
+  parsers.conf: |-
+    [PARSER]
+        Name            json
+        Format          json
+        Time_Key        time
+        Time_Format     %Y-%m-%dT%H:%M:%S.%LZ
+        Time_Keep       On
